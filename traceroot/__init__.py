@@ -79,9 +79,10 @@ def initialize(
             personal data never reaches TraceRoot (other exporters still see
             the original span). Also runs on event attributes and the status
             message. TraceRoot's own bookkeeping keys are not passed in;
-            recorded input, output, metadata and prompt are. A raising function
-            fails closed: every value except numbers and booleans is withheld,
-            and recorded metadata is dropped.
+            recorded input, output, metadata and prompt are. Eval results are
+            redacted too; datasets and scorer definitions are not. A raising
+            function fails closed: every value except numbers and booleans is
+            withheld, and recorded metadata is dropped.
 
     Returns:
         The TracerootClient instance.
@@ -100,6 +101,7 @@ def initialize(
         if _client is not None:
             # An @observe call may have auto-created the client; redact must still apply.
             if redact is not None and _client._span_processor is not None:
+                _client._redact = redact
                 _client._span_processor._redact = redact
                 logger.warning(
                     "traceroot.initialize(redact=...) after the client was created — spans "

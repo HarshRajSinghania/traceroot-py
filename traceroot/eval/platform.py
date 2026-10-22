@@ -34,6 +34,7 @@ from traceroot.eval.results import EvalItemResult, UploadState
 from traceroot.eval.results import case_status as _case_status
 from traceroot.eval.transport import PublishResult, RunHandle
 from traceroot.eval.types import Dataset, EvalCase, Score, _content_revision
+from traceroot.transport.span_processor import redact_attributes
 from traceroot.utils import serialize_value
 
 _DEFAULT_PASS_THRESHOLD = 1.0
@@ -197,6 +198,32 @@ def _resolve_credentials(api_key: str | None, host_url: str | None) -> tuple[str
             api_key = api_key if api_key is not None else client.api_key
             host_url = host_url if host_url is not None else client.host_url
     return api_key or "", host_url or ""
+
+
+# Free-text fields of eval uploads that the configured redact rewrites. They go through as one flat
+# dict of just these keys, so ids, status and scores are never passed in and can never be blanked.
+_REDACTABLE_FIELDS = (
+    "input",
+    "expected_output",
+    "candidate_output",
+    "task_error",
+    "explanation",
+    "error",
+    "string_value",
+    "metadata",
+)
+
+
+def _redact_text(body: dict[str, Any]) -> dict[str, Any]:
+    """Apply the global client's redact to ``body``'s free-text fields (no-op when unset)."""
+    import traceroot
+
+    redact = getattr(traceroot._client, "_redact", None)
+    text = {k: body[k] for k in _REDACTABLE_FIELDS if body.get(k) is not None}
+    if redact is None or not text:
+        return body
+    redacted = redact_attributes(redact, text)
+    return {**body, **{k: redacted.get(k) for k in text}}
 
 
 def _http_json(method: str, url: str, api_key: str, body: dict | None = None) -> dict:
@@ -382,7 +409,10 @@ class PlatformTransport:
         # dump), and over the cap the REGISTRATION 400s -- the run then never starts at all.
         if metadata:
             body["metadata"] = _clamp_metadata(metadata, _METADATA_MAX)
-        resp = self._request_with_retry("POST", "/api/v1/public/evaluation-runs", body)
+        # Scorer definitions (`scorers`) are not redacted; only the run's free-form metadata is.
+        resp = self._request_with_retry(
+            "POST", "/api/v1/public/evaluation-runs", _redact_text(body)
+        )
         self.run_id = resp["evaluation_run_id"]
         # Optional, absent on older/self-hosted backends. Prefer the absolute run_url
         # (resolved against the UI origin) so the link is correct even when the API and
@@ -441,25 +471,24 @@ class PlatformTransport:
         # _scores_payload), so it errors the case exactly like a raised scorer would.
         non_finite = sum(1 for s in item_result.scores if _is_non_finite(s.value))
         status = "errored" if non_finite else _case_status(item_result)
+        body = {
+            "test_case_id": item_result.case_id,
+            "trace_id": item_result.trace_id,
+            # The backend validates these as strings (z.string()); serialize
+            # non-string values (dicts/numbers) to JSON text. `input` is a
+            # REQUIRED string (not nullable) -> coerce a missing input to "".
+            "input": _clamp(_as_text(item_result.input), _PAYLOAD_TEXT_MAX) or "",
+            "expected_output": _clamp(_as_text(item_result.expected), _PAYLOAD_TEXT_MAX),
+            "candidate_output": _clamp(_as_text(item_result.output), _PAYLOAD_TEXT_MAX),
+            "status": status,
+            "task_error": _clamp(item_result.error, _TASK_ERROR_MAX),
+            # Total wall-clock for this case (task + its scorers); nonneg int ms, null
+            # when unknown. Run duration is NOT summed from cases (they run concurrently).
+            "duration_ms": _duration_ms(item_result.duration_ms),
+            "scores": [_redact_text(s) for s in self._scores_payload(item_result)],
+        }
         self._request(
-            "POST",
-            f"/api/v1/public/evaluation-runs/{self.run_id}/results",
-            {
-                "test_case_id": item_result.case_id,
-                "trace_id": item_result.trace_id,
-                # The backend validates these as strings (z.string()); serialize
-                # non-string values (dicts/numbers) to JSON text. `input` is a
-                # REQUIRED string (not nullable) -> coerce a missing input to "".
-                "input": _clamp(_as_text(item_result.input), _PAYLOAD_TEXT_MAX) or "",
-                "expected_output": _clamp(_as_text(item_result.expected), _PAYLOAD_TEXT_MAX),
-                "candidate_output": _clamp(_as_text(item_result.output), _PAYLOAD_TEXT_MAX),
-                "status": status,
-                "task_error": _clamp(item_result.error, _TASK_ERROR_MAX),
-                # Total wall-clock for this case (task + its scorers); nonneg int ms, null
-                # when unknown. Run duration is NOT summed from cases (they run concurrently).
-                "duration_ms": _duration_ms(item_result.duration_ms),
-                "scores": self._scores_payload(item_result),
-            },
+            "POST", f"/api/v1/public/evaluation-runs/{self.run_id}/results", _redact_text(body)
         )
         # Record this case's contribution only AFTER the upsert persisted, keyed by id so a
         # retry or repeated upload replaces (not adds to) the completion aggregate. A case

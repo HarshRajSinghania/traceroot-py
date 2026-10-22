@@ -19,7 +19,8 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 
 from traceroot.constants import SDK_NAME, SDK_VERSION
-from traceroot.transport.span_processor import TracerootSpanProcessor
+from traceroot.span_attributes import SpanAttributes
+from traceroot.transport.span_processor import _REDACTABLE_KEYS, TracerootSpanProcessor
 
 # ── Fixture ────────────────────────────────────────────────────────────────────
 
@@ -539,3 +540,80 @@ def test_redact_non_dict_fails_closed(proc_setup, caplog, returned):
     assert copy.attributes["prompt"] == "[redaction failed]"
     assert copy.attributes["tokens"] == 7
     assert "TypeError" in caplog.text
+
+
+def test_redact_sees_eval_text_and_model_parameters(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: dict.fromkeys(a, "<redacted>")
+    keys = [
+        "traceroot.eval.error",
+        "traceroot.eval.score_comment",
+        "traceroot.llm.model_parameters",
+    ]
+    copy = processor._redacted(_finished(tracer, exporter, **dict.fromkeys(keys, "a@b.com")))
+    assert all(copy.attributes[k] == "<redacted>" for k in keys)
+
+
+def _raise(attrs):
+    raise ValueError
+
+
+@pytest.mark.parametrize("redact", [lambda a: {}, _raise], ids=["empty", "raising"])
+def test_redact_cannot_drop_span_kind_or_error_type(proc_setup, redact):
+    tracer, exporter, processor = proc_setup
+    processor._redact = redact
+    held = {
+        "openinference.span.kind": "LLM",
+        "gen_ai.operation.name": "chat",
+        "llm.model_name": "gpt",
+        "llm.token_count.prompt": 12,
+    }
+    with tracer.start_as_current_span("llm") as span:
+        span.set_attributes(held)
+        span.add_event("exception", {"exception.type": "ValueError"})
+    copy = processor._redacted(exporter.get_finished_spans()[0])
+    assert {k: copy.attributes[k] for k in held} == held
+    assert copy.events[0].attributes["exception.type"] == "ValueError"
+
+
+# Every traceroot.* key the SDK defines must be classified: content (redact sees it) or bookkeeping
+# (held back). A new SpanAttributes key fails here until someone decides which it is.
+_BOOKKEEPING_KEYS = {
+    SpanAttributes.SPAN_TYPE,
+    SpanAttributes.SPAN_TAGS,
+    SpanAttributes.LLM_MODEL,
+    SpanAttributes.LLM_USAGE,
+    SpanAttributes.TRACE_USER_ID,
+    SpanAttributes.TRACE_SESSION_ID,
+    SpanAttributes.TRACE_TAGS,
+    SpanAttributes.GIT_REPO,
+    SpanAttributes.GIT_REF,
+    SpanAttributes.GIT_SOURCE_FILE,
+    SpanAttributes.GIT_SOURCE_LINE,
+    SpanAttributes.GIT_SOURCE_FUNCTION,
+    SpanAttributes.ENVIRONMENT,
+    SpanAttributes.EVAL_CONTRACT_VERSION,
+    SpanAttributes.EVAL_NAME,
+    SpanAttributes.EVAL_RUN_NAME,
+    SpanAttributes.EVAL_RUN_ID,
+    SpanAttributes.EVAL_LOCAL_RUN_ID,
+    SpanAttributes.EVAL_DATASET_NAME,
+    SpanAttributes.EVAL_DATASET_ID,
+    SpanAttributes.EVAL_DATASET_VERSION_ID,
+    SpanAttributes.EVAL_CASE_ID,
+    SpanAttributes.EVAL_CANDIDATE_VERSION,
+    SpanAttributes.EVAL_ENVIRONMENT,
+    SpanAttributes.EVAL_HAS_EXPECTED,
+    SpanAttributes.EVAL_SOURCE_TRACE_ID,
+    SpanAttributes.EVAL_SOURCE_SPAN_ID,
+    SpanAttributes.EVAL_SCORE_TARGET_SPAN_ID,
+    SpanAttributes.EVAL_TASK_NAME,
+    SpanAttributes.EVAL_SCORER_NAME,
+    SpanAttributes.EVAL_SCORE_VALUE,
+}
+
+
+def test_every_traceroot_key_is_classified():
+    defined = {v for k, v in vars(SpanAttributes).items() if k.isupper()}
+    assert _REDACTABLE_KEYS.isdisjoint(_BOOKKEEPING_KEYS)
+    assert defined == _REDACTABLE_KEYS | _BOOKKEEPING_KEYS

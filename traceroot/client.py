@@ -87,10 +87,11 @@ class TracerootClient:
                 attributes and the status message.
                 TraceRoot's own bookkeeping keys are not
                 passed in; recorded input, output, metadata
-                and prompt are. A raising function fails
-                closed: every value except numbers and
-                booleans is withheld, and recorded metadata
-                is dropped.
+                and prompt are. Eval results are redacted
+                too; datasets and scorer definitions are
+                not. A raising function fails closed: every
+                value except numbers and booleans is
+                withheld, and recorded metadata is dropped.
         """
         # Resolve config with env var fallbacks
         self.api_key = api_key or os.environ.get(TRACEROOT_API_KEY, "")

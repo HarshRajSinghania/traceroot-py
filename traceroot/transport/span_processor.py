@@ -51,9 +51,13 @@ _REDACTABLE_KEYS = frozenset(
         SpanAttributes.SPAN_METADATA,
         SpanAttributes.TRACE_METADATA,
         SpanAttributes.LLM_PROMPT,
+        SpanAttributes.LLM_MODEL_PARAMETERS,
+        SpanAttributes.EVAL_ERROR,
+        SpanAttributes.EVAL_SCORE_COMMENT,
     }
 )
-# Held back from redact: mirrors the user, session, model and token keys TraceRoot ingest reads.
+# Held back from redact: mirrors the user, session, model, token, span-kind and error-type keys
+# TraceRoot ingest reads.
 _HELD_BACK_KEYS = frozenset(
     {
         "user.id",
@@ -65,6 +69,11 @@ _HELD_BACK_KEYS = frozenset(
         "decision.model_name",
         "embedding.model_name",
         "ai.model.id",
+        "openinference.span.kind",
+        "gen_ai.operation.name",
+        "ai.operationId",
+        "operation.name",
+        "exception.type",
     }
 )
 _HELD_BACK_PREFIXES = (
@@ -74,19 +83,44 @@ _HELD_BACK_PREFIXES = (
     "decision.token_count.",
     "ai.usage.",
 )
-_METADATA_KEYS = frozenset({SpanAttributes.SPAN_METADATA, SpanAttributes.TRACE_METADATA})
+# Dropped, not marked, when redact fails: ingest expects a JSON object there. "metadata" is the
+# eval run's field (see traceroot/eval/platform.py).
+_METADATA_KEYS = frozenset(
+    {SpanAttributes.SPAN_METADATA, SpanAttributes.TRACE_METADATA, "metadata"}
+)
 _STATUS_KEY = "otel.status_description"
 
 
 def _blanked(theirs: dict[str, Any], ours: dict[str, Any]) -> dict[str, Any]:
-    # Keep numbers and booleans, mark everything else. Metadata is dropped, not marked:
-    # ingest expects a JSON object there.
+    # Keep numbers and booleans, mark everything else, drop metadata.
     failed = {
         k: v if isinstance(v, int | float) else _REDACTION_FAILED
         for k, v in theirs.items()
         if k not in _METADATA_KEYS
     }
     return {**failed, **ours}
+
+
+def redact_attributes(redact: Redact, attrs: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Run ``redact`` over ``attrs``, holding back the keys TraceRoot depends on.
+
+    Held-back keys are not passed in and are merged back unchanged. If ``redact`` raises (or
+    returns a non-dict), it fails closed: every value except numbers and booleans is withheld,
+    and metadata is dropped.
+    """
+    attrs = dict(attrs or {})
+    ours = {
+        k: v
+        for k, v in attrs.items()
+        if (k in _HELD_BACK_KEYS or k.startswith(_HELD_BACK_PREFIXES)) and k not in _REDACTABLE_KEYS
+    }
+    theirs = {k: v for k, v in attrs.items() if k not in ours}
+    try:
+        return {**redact(theirs), **ours}
+    except Exception as exc:
+        # Type name only: the message may quote the value being redacted.
+        logger.warning("TraceRoot: redact raised %s", type(exc).__name__)
+        return _blanked(theirs, ours)
 
 
 # --- Local-eval gate: OTel's own tracing-suppression flag, enforced at span CREATION -------------
@@ -209,9 +243,10 @@ class TracerootSpanProcessor(BatchSpanProcessor):
                 personal data never reaches TraceRoot (other exporters still see
                 the original span). Also runs on event attributes and the status
                 message. TraceRoot's own bookkeeping keys are not passed in;
-                recorded input, output, metadata and prompt are. A raising
-                function fails closed: every value except numbers and booleans
-                is withheld, and recorded metadata is dropped.
+                recorded input, output, metadata and prompt are. Eval results
+                are redacted too; datasets and scorer definitions are not. A
+                raising function fails closed: every value except numbers and
+                booleans is withheld, and recorded metadata is dropped.
         """
         # Resolve flush_at with env var fallback
         if flush_at is None:
@@ -371,22 +406,6 @@ class TracerootSpanProcessor(BatchSpanProcessor):
             self._name_path_by_span_id.pop(span_id_hex, None)
         super().on_end(self._redacted(span) if self._redact else span)
 
-    def _redact_attrs(self, attrs: Mapping[str, Any] | None) -> dict[str, Any]:
-        attrs = dict(attrs or {})
-        ours = {
-            k: v
-            for k, v in attrs.items()
-            if (k in _HELD_BACK_KEYS or k.startswith(_HELD_BACK_PREFIXES))
-            and k not in _REDACTABLE_KEYS
-        }
-        theirs = {k: v for k, v in attrs.items() if k not in ours}
-        try:
-            return {**self._redact(theirs), **ours}
-        except Exception as exc:
-            # Type name only: the message may quote the value being redacted.
-            logger.warning("TracerootSpanProcessor: redact raised %s", type(exc).__name__)
-            return _blanked(theirs, ours)
-
     def _redacted(self, span) -> ReadableSpan:
         # Only TraceRoot's exporter gets this copy; other processors see the original span.
         # Attributes are a plain dict here, so dropped-attribute counts read 0 on the copy.
@@ -395,7 +414,7 @@ class TracerootSpanProcessor(BatchSpanProcessor):
         attrs = dict(span.attributes or {})
         if status.description:
             attrs[_STATUS_KEY] = status.description
-        attrs = self._redact_attrs(attrs)
+        attrs = redact_attributes(self._redact, attrs)
         description = attrs.pop(_STATUS_KEY, None)
         if status.description:
             status = Status(
@@ -408,7 +427,8 @@ class TracerootSpanProcessor(BatchSpanProcessor):
             resource=span.resource,
             attributes={**attrs, "traceroot.redacted": True},
             events=[
-                Event(e.name, self._redact_attrs(e.attributes), e.timestamp) for e in span.events
+                Event(e.name, redact_attributes(self._redact, e.attributes), e.timestamp)
+                for e in span.events
             ],
             links=span.links,
             kind=span.kind,

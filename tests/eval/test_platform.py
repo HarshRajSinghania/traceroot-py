@@ -4,6 +4,7 @@ Network is stubbed via PlatformTransport._request so no real HTTP happens.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -114,6 +115,51 @@ class TestRunUrl:
         state = t.finish_run(RunHandle(name="e", dataset_name="d", metadata=None))
         assert state.dashboard_url is None
         assert state.status == "uploaded"
+
+
+def _redaction_item():
+    from traceroot.eval.results import EvalItemResult
+
+    return EvalItemResult(
+        case_id="tc0",
+        input="mail a@b.com",
+        output="sent to a@b.com",
+        expected="a@b.com",
+        scores=[Score("acc", 1.0, comment="a@b.com"), Score("label", "a@b.com")],
+        scorer_errors={"judge": "failed on a@b.com"},
+        error="boom a@b.com",
+        trace_id="abc123",
+    )
+
+
+class TestRedaction:
+    def _run(self, monkeypatch, redact):
+        monkeypatch.setattr(traceroot, "_client", SimpleNamespace(_redact=redact))
+        t = RecordingTransport("ds_1", scorer_names=["acc"], api_key="tr-x", host_url="https://h")
+        t.create_run("r", "d", {"owner": "a@b.com"})
+        t.record_item_result(None, _redaction_item())
+        return t.requests[0][2], t.requests[-1][2]
+
+    def test_eval_upload_carries_no_email(self, monkeypatch):
+        def scrub(attrs):
+            return {k: str(v).replace("a@b.com", "<email>") for k, v in attrs.items()}
+
+        run, result = self._run(monkeypatch, scrub)
+        assert "a@b.com" not in json.dumps(run) + json.dumps(result)
+        assert result["test_case_id"] == "tc0"
+
+    def test_raising_redact_blanks_text_keeps_scores_ids_status(self, monkeypatch):
+        def boom(attrs):
+            raise ValueError
+
+        run, result = self._run(monkeypatch, boom)
+        assert run.get("metadata") is None
+        assert result["input"] == result["task_error"] == "[redaction failed]"
+        assert (result["test_case_id"], result["trace_id"]) == ("tc0", "abc123")
+        assert result["status"] == "errored"
+        acc = result["scores"][0]
+        assert (acc["numeric_value"], acc["explanation"]) == (1.0, "[redaction failed]")
+        assert "a@b.com" not in json.dumps(run) + json.dumps(result)
 
 
 class TestPlatformTransport:
