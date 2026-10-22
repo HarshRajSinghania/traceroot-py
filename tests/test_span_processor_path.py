@@ -529,3 +529,13 @@ def test_redact_raising_fails_closed(proc_setup, caplog):
     assert "traceroot.trace.metadata" not in copy.attributes
     assert "ValueError" in caplog.text
     assert "secret" not in caplog.text
+
+
+@pytest.mark.parametrize("returned", [None, ["x"]])
+def test_redact_non_dict_fails_closed(proc_setup, caplog, returned):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: returned
+    copy = processor._redacted(_finished(tracer, exporter, prompt="secret", tokens=7))
+    assert copy.attributes["prompt"] == "[redaction failed]"
+    assert copy.attributes["tokens"] == 7
+    assert "TypeError" in caplog.text

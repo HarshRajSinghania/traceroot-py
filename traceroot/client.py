@@ -81,14 +81,16 @@ class TracerootClient:
                 Falls back to TRACEROOT_GIT_REF env var,
                 then auto-detected from git HEAD.
             redact: Rewrites each finished span's attributes
-                before export to TraceRoot, so personal data
-                never leaves the process. Also runs on event
-                attributes and the status message. TraceRoot's
-                own bookkeeping keys are not passed in; recorded
-                input, output, metadata and prompt are. A
-                raising function fails closed: every value
-                except numbers and booleans is withheld, and
-                recorded metadata is dropped.
+                before export, so personal data never
+                reaches TraceRoot (other exporters still see
+                the original span). Also runs on event
+                attributes and the status message.
+                TraceRoot's own bookkeeping keys are not
+                passed in; recorded input, output, metadata
+                and prompt are. A raising function fails
+                closed: every value except numbers and
+                booleans is withheld, and recorded metadata
+                is dropped.
         """
         # Resolve config with env var fallbacks
         self.api_key = api_key or os.environ.get(TRACEROOT_API_KEY, "")

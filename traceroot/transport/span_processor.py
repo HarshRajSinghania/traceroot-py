@@ -205,13 +205,13 @@ class TracerootSpanProcessor(BatchSpanProcessor):
                 as ``traceroot.git.repo`` on every recording span.
             git_ref: Git reference (commit SHA, tag, branch). When provided,
                 stamped as ``traceroot.git.ref`` on every recording span.
-            redact: Rewrites each finished span's attributes before export to
-                TraceRoot, so personal data never leaves the process. Also runs
-                on event attributes and the status message. TraceRoot's own
-                bookkeeping keys are not passed in; recorded input, output,
-                metadata and prompt are. A raising function fails
-                closed: every value except numbers and booleans is withheld,
-                and recorded metadata is dropped.
+            redact: Rewrites each finished span's attributes before export, so
+                personal data never reaches TraceRoot (other exporters still see
+                the original span). Also runs on event attributes and the status
+                message. TraceRoot's own bookkeeping keys are not passed in;
+                recorded input, output, metadata and prompt are. A raising
+                function fails closed: every value except numbers and booleans
+                is withheld, and recorded metadata is dropped.
         """
         # Resolve flush_at with env var fallback
         if flush_at is None:

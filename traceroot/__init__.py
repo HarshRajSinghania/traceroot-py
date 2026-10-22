@@ -75,12 +75,13 @@ def initialize(
             TRACEROOT_ENABLED env var, then True.
         integrations: Libraries to auto-instrument. Use Integration enum
             values (e.g. [Integration.OPENAI, Integration.LANGCHAIN]).
-        redact: Rewrites each finished span's attributes before export to
-            TraceRoot, so personal data never leaves the process. Also runs on
-            event attributes and the status message. TraceRoot's own bookkeeping
-            keys are not passed in; recorded input, output, metadata and prompt
-            are. A raising function fails closed: every value except numbers
-            and booleans is withheld, and recorded metadata is dropped.
+        redact: Rewrites each finished span's attributes before export, so
+            personal data never reaches TraceRoot (other exporters still see
+            the original span). Also runs on event attributes and the status
+            message. TraceRoot's own bookkeeping keys are not passed in;
+            recorded input, output, metadata and prompt are. A raising function
+            fails closed: every value except numbers and booleans is withheld,
+            and recorded metadata is dropped.
 
     Returns:
         The TracerootClient instance.
@@ -97,6 +98,13 @@ def initialize(
     global _client
     with _init_lock:
         if _client is not None:
+            # An @observe call may have auto-created the client; redact must still apply.
+            if redact is not None and _client._span_processor is not None:
+                _client._span_processor._redact = redact
+                logger.warning(
+                    "traceroot.initialize(redact=...) after the client was created — spans "
+                    "exported before this call were not redacted."
+                )
             logger.warning(
                 "traceroot.initialize() called more than once — ignoring. "
                 "Call traceroot.shutdown() first if you need to reinitialize."
