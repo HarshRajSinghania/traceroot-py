@@ -554,6 +554,19 @@ def test_redact_sees_eval_text_and_model_parameters(proc_setup):
     assert all(copy.attributes[k] == "<redacted>" for k in keys)
 
 
+def test_redact_sees_string_score_value_numbers_survive_failure(proc_setup):
+    tracer, exporter, processor = proc_setup
+    key = SpanAttributes.EVAL_SCORE_VALUE
+    processor._redact = lambda a: {k: str(v).replace("a@b.com", "<email>") for k, v in a.items()}
+    assert (
+        processor._redacted(_finished(tracer, exporter, **{key: "a@b.com"})).attributes[key]
+        == "<email>"
+    )
+    exporter.clear()
+    processor._redact = _raise
+    assert processor._redacted(_finished(tracer, exporter, **{key: 0.5})).attributes[key] == 0.5
+
+
 def _raise(attrs):
     raise ValueError
 
@@ -609,7 +622,6 @@ _BOOKKEEPING_KEYS = {
     SpanAttributes.EVAL_SCORE_TARGET_SPAN_ID,
     SpanAttributes.EVAL_TASK_NAME,
     SpanAttributes.EVAL_SCORER_NAME,
-    SpanAttributes.EVAL_SCORE_VALUE,
 }
 
 

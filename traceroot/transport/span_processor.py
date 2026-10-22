@@ -54,6 +54,7 @@ _REDACTABLE_KEYS = frozenset(
         SpanAttributes.LLM_MODEL_PARAMETERS,
         SpanAttributes.EVAL_ERROR,
         SpanAttributes.EVAL_SCORE_COMMENT,
+        SpanAttributes.EVAL_SCORE_VALUE,
     }
 )
 # Held back from redact: mirrors the user, session, model, token, span-kind and error-type keys
