@@ -231,6 +231,23 @@ def _redact_text(body: dict[str, Any]) -> dict[str, Any]:
     return {**body, **{k: redacted.get(k) for k in text}}
 
 
+# Contract limits of those fields, applied after redact so it always sees the whole value.
+_TEXT_LIMITS = {
+    "input": _PAYLOAD_TEXT_MAX,
+    "expected_output": _PAYLOAD_TEXT_MAX,
+    "candidate_output": _PAYLOAD_TEXT_MAX,
+    "task_error": _TASK_ERROR_MAX,
+    "explanation": _EXPLANATION_MAX,
+    "error": _SCORE_ERROR_MAX,
+    "string_value": _STRING_VALUE_MAX,
+}
+
+
+def _clamp_text(body: dict[str, Any]) -> dict[str, Any]:
+    """Clamp ``body``'s free-text fields to their contract limits."""
+    return {**body, **{k: _clamp(body[k], n) for k, n in _TEXT_LIMITS.items() if k in body}}
+
+
 def _redact_metadata(metadata: dict) -> Any:
     """Pass run metadata to the configured redact as JSON text under ``metadata``. Anything that
     does not parse back to a JSON object (including a failed redact) is omitted (None)."""
@@ -495,17 +512,17 @@ class PlatformTransport:
             # The backend validates these as strings (z.string()); serialize
             # non-string values (dicts/numbers) to JSON text. `input` is a
             # REQUIRED string (not nullable) -> coerce a missing input to "".
-            "input": _clamp(_as_text(item_result.input), _PAYLOAD_TEXT_MAX) or "",
-            "expected_output": _clamp(_as_text(item_result.expected), _PAYLOAD_TEXT_MAX),
-            "candidate_output": _clamp(_as_text(item_result.output), _PAYLOAD_TEXT_MAX),
+            "input": _as_text(item_result.input) or "",
+            "expected_output": _as_text(item_result.expected),
+            "candidate_output": _as_text(item_result.output),
             "status": status,
-            "task_error": _clamp(item_result.error, _TASK_ERROR_MAX),
+            "task_error": item_result.error,
             # Total wall-clock for this case (task + its scorers); nonneg int ms, null
             # when unknown. Run duration is NOT summed from cases (they run concurrently).
             "duration_ms": _duration_ms(item_result.duration_ms),
-            "scores": [_redact_text(s) for s in self._scores_payload(item_result)],
+            "scores": [_clamp_text(_redact_text(s)) for s in self._scores_payload(item_result)],
         }
-        body = _redact_text(body)
+        body = _clamp_text(_redact_text(body))
         body["input"] = body["input"] or ""  # required string; redact may have removed it
         self._request("POST", f"/api/v1/public/evaluation-runs/{self.run_id}/results", body)
         # Record this case's contribution only AFTER the upsert persisted, keyed by id so a
@@ -607,7 +624,7 @@ class PlatformTransport:
                 # that the backend's JSON.parse rejects (400ing the whole run) while JavaScript
                 # writes null (a silently fabricated empty score that poisons the aggregate mean).
                 # Both SDKs report it as what it is: the scorer failed to produce a value.
-                entry["error"] = _clamp(_non_finite_error(s.name, v), _SCORE_ERROR_MAX)
+                entry["error"] = _non_finite_error(s.name, v)
                 payload.append(entry)
                 continue
             if isinstance(v, bool):
@@ -615,9 +632,9 @@ class PlatformTransport:
             elif isinstance(v, (int, float)):
                 entry["numeric_value"] = float(v)
             else:
-                entry["string_value"] = _clamp(str(v), _STRING_VALUE_MAX)
+                entry["string_value"] = str(v)
             if s.comment is not None:
-                entry["explanation"] = _clamp(s.comment, _EXPLANATION_MAX)
+                entry["explanation"] = s.comment
             passed = self._score_passed(s, single_emission=len(item_result.scores) == 1)
             if passed is not None:
                 entry["passed"] = passed
@@ -630,7 +647,7 @@ class PlatformTransport:
                 {
                     "scorer_name": name,
                     "scorer_version": self._declared_version(name),
-                    "error": _clamp(msg, _SCORE_ERROR_MAX),
+                    "error": msg,
                 }
             )
         return payload

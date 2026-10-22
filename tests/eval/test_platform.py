@@ -162,6 +162,24 @@ class TestRedaction:
         assert {"error": "failed on a@b.com"} in seen
         assert [s.get("explanation") for s in result["scores"]] == ["<redacted>", None, None]
 
+    def test_redact_sees_the_full_value_before_it_is_clamped(self, monkeypatch):
+        from traceroot.eval.platform import _PAYLOAD_TEXT_MAX
+        from traceroot.eval.results import EvalItemResult
+
+        def scrub(attrs):
+            return {k: v.replace("john@example.com", "<email>") for k, v in attrs.items()}
+
+        monkeypatch.setattr(traceroot, "_client", SimpleNamespace(_redact=scrub))
+        t = RecordingTransport("ds_1", scorer_names=[], api_key="tr-x", host_url="https://h")
+        t.create_run("r", "d", None)
+        # The clamp cut lands inside the email, and the redacted value is still over the limit.
+        text = "x" * (_PAYLOAD_TEXT_MAX - 20) + "john@example.com" + "y" * 100
+        item = EvalItemResult("tc0", text, None, None, [], {}, None, None)
+        t.record_item_result(None, item)
+        sent = t.requests[-1][2]["input"]
+        assert "john@e" not in sent
+        assert len(sent) == _PAYLOAD_TEXT_MAX
+
     def test_removed_input_is_sent_empty_and_bad_metadata_is_omitted(self, monkeypatch):
         run, result = self._run(monkeypatch, lambda a: {})
         assert result["input"] == ""
