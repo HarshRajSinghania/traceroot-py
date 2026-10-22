@@ -34,7 +34,7 @@ from traceroot.eval.results import EvalItemResult, UploadState
 from traceroot.eval.results import case_status as _case_status
 from traceroot.eval.transport import PublishResult, RunHandle
 from traceroot.eval.types import Dataset, EvalCase, Score, _content_revision
-from traceroot.transport.span_processor import redact_attributes
+from traceroot.transport.span_processor import Redact, redact_attributes
 from traceroot.utils import serialize_value
 
 _DEFAULT_PASS_THRESHOLD = 1.0
@@ -200,8 +200,9 @@ def _resolve_credentials(api_key: str | None, host_url: str | None) -> tuple[str
     return api_key or "", host_url or ""
 
 
-# Free-text fields of eval uploads that the configured redact rewrites. They go through as one flat
-# dict of just these keys, so ids, status and scores are never passed in and can never be blanked.
+# Free-text fields of eval uploads that the configured redact rewrites. Each request body (and each
+# score) goes through as its own flat dict of just these keys, so ids, status and score values are
+# never passed in and can never be blanked.
 _REDACTABLE_FIELDS = (
     "input",
     "expected_output",
@@ -210,20 +211,38 @@ _REDACTABLE_FIELDS = (
     "explanation",
     "error",
     "string_value",
-    "metadata",
 )
 
 
-def _redact_text(body: dict[str, Any]) -> dict[str, Any]:
-    """Apply the global client's redact to ``body``'s free-text fields (no-op when unset)."""
+def _configured_redact() -> Redact | None:
+    """The global client's redact, without creating a client."""
     import traceroot
 
-    redact = getattr(traceroot._client, "_redact", None)
+    return getattr(traceroot._client, "_redact", None)
+
+
+def _redact_text(body: dict[str, Any]) -> dict[str, Any]:
+    """Apply the configured redact to ``body``'s free-text fields (no-op when unset)."""
+    redact = _configured_redact()
     text = {k: body[k] for k in _REDACTABLE_FIELDS if body.get(k) is not None}
     if redact is None or not text:
         return body
     redacted = redact_attributes(redact, text)
     return {**body, **{k: redacted.get(k) for k in text}}
+
+
+def _redact_metadata(metadata: dict) -> Any:
+    """Pass run metadata to the configured redact as JSON text under ``metadata``. Anything that
+    does not parse back to a JSON object (including a failed redact) is omitted (None)."""
+    redact = _configured_redact()
+    if redact is None:
+        return metadata
+    try:
+        text = json.dumps(serialize_value(metadata))
+        parsed = json.loads(redact_attributes(redact, {"metadata": text}).get("metadata"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _http_json(method: str, url: str, api_key: str, body: dict | None = None) -> dict:
@@ -407,12 +426,11 @@ class PlatformTransport:
         # match its absent-or-null rules rather than sending an empty object. Clamped like every
         # other capped field: metadata is whatever the caller put there (a whole prompt, a config
         # dump), and over the cap the REGISTRATION 400s -- the run then never starts at all.
-        if metadata:
-            body["metadata"] = _clamp_metadata(metadata, _METADATA_MAX)
         # Scorer definitions (`scorers`) are not redacted; only the run's free-form metadata is.
-        resp = self._request_with_retry(
-            "POST", "/api/v1/public/evaluation-runs", _redact_text(body)
-        )
+        sent_metadata = _redact_metadata(metadata) if metadata else None
+        if sent_metadata:
+            body["metadata"] = _clamp_metadata(sent_metadata, _METADATA_MAX)
+        resp = self._request_with_retry("POST", "/api/v1/public/evaluation-runs", body)
         self.run_id = resp["evaluation_run_id"]
         # Optional, absent on older/self-hosted backends. Prefer the absolute run_url
         # (resolved against the UI origin) so the link is correct even when the API and
@@ -487,9 +505,9 @@ class PlatformTransport:
             "duration_ms": _duration_ms(item_result.duration_ms),
             "scores": [_redact_text(s) for s in self._scores_payload(item_result)],
         }
-        self._request(
-            "POST", f"/api/v1/public/evaluation-runs/{self.run_id}/results", _redact_text(body)
-        )
+        body = _redact_text(body)
+        body["input"] = body["input"] or ""  # required string; redact may have removed it
+        self._request("POST", f"/api/v1/public/evaluation-runs/{self.run_id}/results", body)
         # Record this case's contribution only AFTER the upsert persisted, keyed by id so a
         # retry or repeated upload replaces (not adds to) the completion aggregate. A case
         # that produced at least one score (and no task error) counts toward scored_count;

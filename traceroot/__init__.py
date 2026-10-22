@@ -100,13 +100,14 @@ def initialize(
     with _init_lock:
         if _client is not None:
             # An @observe call may have auto-created the client; redact must still apply.
-            if redact is not None and _client._span_processor is not None:
+            if redact is not None:
                 _client._redact = redact
-                _client._span_processor._redact = redact
-                logger.warning(
-                    "traceroot.initialize(redact=...) after the client was created — spans "
-                    "exported before this call were not redacted."
-                )
+                if _client._span_processor is not None:
+                    _client._span_processor._redact = redact
+                    logger.warning(
+                        "traceroot.initialize(redact=...) after the client was created — spans "
+                        "exported before this call were not redacted."
+                    )
             logger.warning(
                 "traceroot.initialize() called more than once — ignoring. "
                 "Call traceroot.shutdown() first if you need to reinitialize."

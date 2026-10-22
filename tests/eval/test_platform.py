@@ -147,13 +147,47 @@ class TestRedaction:
         run, result = self._run(monkeypatch, scrub)
         assert "a@b.com" not in json.dumps(run) + json.dumps(result)
         assert result["test_case_id"] == "tc0"
+        assert run["metadata"] == {"owner": "<email>"}
+
+    def test_each_score_is_redacted_on_its_own(self, monkeypatch):
+        seen = []
+
+        def record(attrs):
+            seen.append(attrs)
+            return dict.fromkeys(attrs, "<redacted>")
+
+        _, result = self._run(monkeypatch, record)
+        assert {"explanation": "a@b.com"} in seen
+        assert {"string_value": "a@b.com"} in seen
+        assert {"error": "failed on a@b.com"} in seen
+        assert [s.get("explanation") for s in result["scores"]] == ["<redacted>", None, None]
+
+    def test_removed_input_is_sent_empty_and_bad_metadata_is_omitted(self, monkeypatch):
+        run, result = self._run(monkeypatch, lambda a: {})
+        assert result["input"] == ""
+        assert "metadata" not in run
+
+    def test_redact_applies_when_tracing_is_disabled(self):
+        from tests.utils import reset_traceroot
+
+        reset_traceroot()
+        traceroot.initialize(api_key="tr-x", enabled=False, redact=lambda a: {})
+        try:
+            t = RecordingTransport(
+                "ds_1", scorer_names=["acc"], api_key="tr-x", host_url="https://h"
+            )
+            t.create_run("r", "d", None)
+            t.record_item_result(None, _redaction_item())
+            assert "a@b.com" not in json.dumps(t.requests[-1][2])
+        finally:
+            reset_traceroot()
 
     def test_raising_redact_blanks_text_keeps_scores_ids_status(self, monkeypatch):
         def boom(attrs):
             raise ValueError
 
         run, result = self._run(monkeypatch, boom)
-        assert run.get("metadata") is None
+        assert "metadata" not in run
         assert result["input"] == result["task_error"] == "[redaction failed]"
         assert (result["test_case_id"], result["trace_id"]) == ("tc0", "abc123")
         assert result["status"] == "errored"

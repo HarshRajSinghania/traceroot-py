@@ -83,11 +83,8 @@ _HELD_BACK_PREFIXES = (
     "decision.token_count.",
     "ai.usage.",
 )
-# Dropped, not marked, when redact fails: ingest expects a JSON object there. "metadata" is the
-# eval run's field (see traceroot/eval/platform.py).
-_METADATA_KEYS = frozenset(
-    {SpanAttributes.SPAN_METADATA, SpanAttributes.TRACE_METADATA, "metadata"}
-)
+# Dropped, not marked, when redact fails: ingest expects a JSON object there.
+_METADATA_KEYS = frozenset({SpanAttributes.SPAN_METADATA, SpanAttributes.TRACE_METADATA})
 _STATUS_KEY = "otel.status_description"
 
 
