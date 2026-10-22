@@ -8,6 +8,8 @@ import logging
 import os
 import threading
 from collections import OrderedDict
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from openinference.instrumentation import suppress_tracing
 from opentelemetry import trace as otel_trace
@@ -16,8 +18,10 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter,
 )
 from opentelemetry.instrumentation.utils import is_instrumentation_enabled
+from opentelemetry.sdk.trace import Event, ReadableSpan
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
+from opentelemetry.trace import Status
 
 from traceroot.constants import (
     DEFAULT_FLUSH_AT,
@@ -31,11 +35,59 @@ from traceroot.env import (
     TRACEROOT_FLUSH_INTERVAL,
     TRACEROOT_TIMEOUT,
 )
+from traceroot.span_attributes import SpanAttributes
 
 logger = logging.getLogger(__name__)
 
 _PATH_MAP_MAX: int = 1024
 _PathMap = OrderedDict[str, list[str]]
+Redact = Callable[[dict[str, Any]], dict[str, Any]]
+_REDACTION_FAILED = "[redaction failed]"
+# TraceRoot keys that carry user content, so redact sees them; other traceroot.* keys are held back.
+_REDACTABLE_KEYS = frozenset(
+    {
+        SpanAttributes.SPAN_INPUT,
+        SpanAttributes.SPAN_OUTPUT,
+        SpanAttributes.SPAN_METADATA,
+        SpanAttributes.TRACE_METADATA,
+        SpanAttributes.LLM_PROMPT,
+    }
+)
+# Held back from redact: mirrors the user, session, model and token keys TraceRoot ingest reads.
+_HELD_BACK_KEYS = frozenset(
+    {
+        "user.id",
+        "session.user_id",
+        "session.id",
+        "gen_ai.system",
+        "gen_ai.request.model",
+        "llm.model_name",
+        "decision.model_name",
+        "embedding.model_name",
+        "ai.model.id",
+    }
+)
+_HELD_BACK_PREFIXES = (
+    "traceroot.",
+    "llm.token_count.",
+    "gen_ai.usage.",
+    "decision.token_count.",
+    "ai.usage.",
+)
+_METADATA_KEYS = frozenset({SpanAttributes.SPAN_METADATA, SpanAttributes.TRACE_METADATA})
+_STATUS_KEY = "otel.status_description"
+
+
+def _blanked(theirs: dict[str, Any], ours: dict[str, Any]) -> dict[str, Any]:
+    # Keep numbers and booleans, mark everything else. Metadata is dropped, not marked:
+    # ingest expects a JSON object there.
+    failed = {
+        k: v if isinstance(v, int | float) else _REDACTION_FAILED
+        for k, v in theirs.items()
+        if k not in _METADATA_KEYS
+    }
+    return {**failed, **ours}
+
 
 # --- Local-eval gate: OTel's own tracing-suppression flag, enforced at span CREATION -------------
 # A local=True eval run must not let the spans it originates leave the process, even when the app
@@ -135,6 +187,7 @@ class TracerootSpanProcessor(BatchSpanProcessor):
         timeout: float | None = None,
         git_repo: str | None = None,
         git_ref: str | None = None,
+        redact: Redact | None = None,
     ):
         """Initialize the span processor.
 
@@ -152,6 +205,13 @@ class TracerootSpanProcessor(BatchSpanProcessor):
                 as ``traceroot.git.repo`` on every recording span.
             git_ref: Git reference (commit SHA, tag, branch). When provided,
                 stamped as ``traceroot.git.ref`` on every recording span.
+            redact: Rewrites each finished span's attributes before export to
+                TraceRoot, so personal data never leaves the process. Also runs
+                on event attributes and the status message. TraceRoot's own
+                bookkeeping keys are not passed in; recorded input, output,
+                metadata and prompt are. A raising function fails
+                closed: every value except numbers and booleans is withheld,
+                and recorded metadata is dropped.
         """
         # Resolve flush_at with env var fallback
         if flush_at is None:
@@ -196,6 +256,7 @@ class TracerootSpanProcessor(BatchSpanProcessor):
         self._flush_interval = flush_interval
         self._git_repo = git_repo
         self._git_ref = git_ref
+        self._redact = redact
         self._paths_lock = threading.RLock()
         # Bounded OrderedDict: evicts oldest entry when capacity is exceeded,
         # eliminating the on_end race where a parent was removed before a
@@ -308,7 +369,54 @@ class TracerootSpanProcessor(BatchSpanProcessor):
             span_id_hex = format(span.context.span_id, "016x")
             self._ids_path_by_span_id.pop(span_id_hex, None)
             self._name_path_by_span_id.pop(span_id_hex, None)
-        super().on_end(span)
+        super().on_end(self._redacted(span) if self._redact else span)
+
+    def _redact_attrs(self, attrs: Mapping[str, Any] | None) -> dict[str, Any]:
+        attrs = dict(attrs or {})
+        ours = {
+            k: v
+            for k, v in attrs.items()
+            if (k in _HELD_BACK_KEYS or k.startswith(_HELD_BACK_PREFIXES))
+            and k not in _REDACTABLE_KEYS
+        }
+        theirs = {k: v for k, v in attrs.items() if k not in ours}
+        try:
+            return {**self._redact(theirs), **ours}
+        except Exception as exc:
+            # Type name only: the message may quote the value being redacted.
+            logger.warning("TracerootSpanProcessor: redact raised %s", type(exc).__name__)
+            return _blanked(theirs, ours)
+
+    def _redacted(self, span) -> ReadableSpan:
+        # Only TraceRoot's exporter gets this copy; other processors see the original span.
+        # Attributes are a plain dict here, so dropped-attribute counts read 0 on the copy.
+        # The status message rides along with the attributes and is popped back out.
+        status = span.status
+        attrs = dict(span.attributes or {})
+        if status.description:
+            attrs[_STATUS_KEY] = status.description
+        attrs = self._redact_attrs(attrs)
+        description = attrs.pop(_STATUS_KEY, None)
+        if status.description:
+            status = Status(
+                status.status_code, description if isinstance(description, str) else None
+            )
+        return ReadableSpan(
+            name=span.name,
+            context=span.context,
+            parent=span.parent,
+            resource=span.resource,
+            attributes={**attrs, "traceroot.redacted": True},
+            events=[
+                Event(e.name, self._redact_attrs(e.attributes), e.timestamp) for e in span.events
+            ],
+            links=span.links,
+            kind=span.kind,
+            status=status,
+            start_time=span.start_time,
+            end_time=span.end_time,
+            instrumentation_scope=span.instrumentation_scope,
+        )
 
     def shutdown(self):
         self._shut_down = True

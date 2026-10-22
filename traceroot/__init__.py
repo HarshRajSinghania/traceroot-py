@@ -34,6 +34,7 @@ from traceroot.constants import SDK_VERSION as __version__
 from traceroot.context import get_current_span_id, get_current_trace_id
 from traceroot.decorators import observe
 from traceroot.instrumentation import Integration
+from traceroot.transport.span_processor import Redact
 from traceroot.update import update_current_span, update_current_trace
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ def initialize(
     integrations: list[Integration] | None = None,
     git_repo: str | None = None,
     git_ref: str | None = None,
+    redact: Redact | None = None,
 ) -> TracerootClient:
     """Initialize the global Traceroot client.
 
@@ -73,6 +75,12 @@ def initialize(
             TRACEROOT_ENABLED env var, then True.
         integrations: Libraries to auto-instrument. Use Integration enum
             values (e.g. [Integration.OPENAI, Integration.LANGCHAIN]).
+        redact: Rewrites each finished span's attributes before export to
+            TraceRoot, so personal data never leaves the process. Also runs on
+            event attributes and the status message. TraceRoot's own bookkeeping
+            keys are not passed in; recorded input, output, metadata and prompt
+            are. A raising function fails closed: every value except numbers
+            and booleans is withheld, and recorded metadata is dropped.
 
     Returns:
         The TracerootClient instance.
@@ -104,6 +112,7 @@ def initialize(
             integrations=integrations,
             git_repo=git_repo,
             git_ref=git_ref,
+            redact=redact,
         )
     return _client
 

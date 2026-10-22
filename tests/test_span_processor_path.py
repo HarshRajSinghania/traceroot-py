@@ -8,6 +8,7 @@ Covers:
   - Map entries are cleaned up on span end (no memory leak)
   - SDK name/version attributes are stamped on every recording span
   - Non-recording spans are silently skipped (no attributes, no map entries)
+  - redact rewrites a copy for export, keeps traceroot.* keys, and fails closed
 """
 
 import pytest
@@ -447,3 +448,84 @@ def test_git_attrs_on_child_spans():
     child = next(s for s in exporter.get_finished_spans() if s.name == "child")
     assert child.attributes.get("traceroot.git.repo") == "org/repo"
     assert child.attributes.get("traceroot.git.ref") == "deadbeef" * 5
+
+
+# ── redact ─────────────────────────────────────────────────────────────────────
+
+
+def _finished(tracer, exporter, **attrs):
+    with tracer.start_as_current_span("llm") as span:
+        span.set_attributes(attrs)
+    return exporter.get_finished_spans()[0]
+
+
+def test_redact_unset_by_default(proc_setup):
+    _, _, processor = proc_setup
+    assert processor._redact is None
+
+
+def test_redact_rewrites_copy_and_leaves_original(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: {**a, "user.email": "<email>"}
+    span = _finished(tracer, exporter, **{"user.email": "a@b.com"})
+    copy = processor._redacted(span)
+    assert copy.attributes["user.email"] == "<email>"
+    assert copy.attributes["traceroot.redacted"] is True
+    assert span.attributes["user.email"] == "a@b.com"
+
+
+def test_redact_cannot_drop_traceroot_keys(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: {}
+    copy = processor._redacted(_finished(tracer, exporter, prompt="hi"))
+    assert "prompt" not in copy.attributes
+    assert copy.attributes["traceroot.sdk.name"] == SDK_NAME
+    assert _path(copy) == ["llm"]
+
+
+def test_redact_cannot_drop_ingest_keys(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: {}
+    held = {
+        "user.id": "u1",
+        "session.id": "s1",
+        "llm.model_name": "gpt",
+        "llm.token_count.prompt": 12,
+    }
+    copy = processor._redacted(_finished(tracer, exporter, **held))
+    assert {k: copy.attributes[k] for k in held} == held
+
+
+def test_redact_sees_recorded_input(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: {k: str(v).replace("a@b.com", "<email>") for k, v in a.items()}
+    span = _finished(tracer, exporter, **{"traceroot.span.input": '{"to": "a@b.com"}'})
+    copy = processor._redacted(span)
+    assert copy.attributes["traceroot.span.input"] == '{"to": "<email>"}'
+    assert _path(copy) == ["llm"]
+
+
+def test_redact_raising_fails_closed(proc_setup, caplog):
+    tracer, exporter, processor = proc_setup
+
+    def boom(attrs):
+        raise ValueError(f"bad {attrs['prompt']}")
+
+    processor._redact = boom
+    copy = processor._redacted(
+        _finished(
+            tracer,
+            exporter,
+            prompt="secret",
+            tokens=7,
+            tags=["a@b.com"],
+            **{"traceroot.span.metadata": "{}", "traceroot.trace.metadata": "{}"},
+        )
+    )
+    assert copy.attributes["prompt"] == "[redaction failed]"
+    assert copy.attributes["tags"] == "[redaction failed]"
+    assert copy.attributes["tokens"] == 7
+    assert "traceroot.span.metadata" not in copy.attributes
+    assert "traceroot.trace.metadata" not in copy.attributes
+    assert "ValueError" in caplog.text
+    assert "secret" not in caplog.text
